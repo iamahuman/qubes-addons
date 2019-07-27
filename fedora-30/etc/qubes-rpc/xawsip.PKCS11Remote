@@ -1,0 +1,2 @@
+#!/bin/sh
+exec timeout -k 3 10 /bin/sh -c '/usr/bin/stdbuf -i0 -o0 /usr/bin/head -c 131072 | SOFTHSM2_CONF=/etc/xawsip-softhsm2.conf /usr/bin/p11-kit remote /usr/lib64/pkcs11/libsofthsm2.so' 2> /dev/null

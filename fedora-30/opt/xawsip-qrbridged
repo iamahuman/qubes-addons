@@ -1,0 +1,283 @@
+#!/usr/bin/python
+# Copyright (c) 2019 Jinoh Kang
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+# pylint: disable=missing-docstring, invalid-name, useless-object-inheritance, too-few-public-methods
+import sys
+import os
+import time
+import errno
+import signal
+import select
+import socket
+import subprocess
+import grp
+import pwd
+import traceback
+
+try:
+    SelectError = select.error
+except AttributeError:
+    SelectError = OSError
+
+try:
+    SocketError = socket.error
+except AttributeError:
+    SocketError = OSError
+
+if not hasattr('', 'decode') and hasattr('', 'encode'):
+    def str_to_bytes(x):
+        if isinstance(x, str):
+            return x.encode(errors='surrogateescape')
+        return x
+else:
+    def str_to_bytes(x):
+        return x
+
+ACCEPT_IGNORE_ERRNOS = (
+    errno.EINTR,
+    errno.EAGAIN,
+    errno.EWOULDBLOCK,
+    errno.ECONNABORTED,
+    errno.EMFILE,
+    errno.ENFILE,
+    errno.ENOBUFS,
+    errno.EPROTO,
+)
+
+class ChildrenReaper(object):
+    '''hi'''
+
+    def __init__(self):
+        self.pidinfo = {}
+
+    def __call__(self, _signum=None, _frame=None):
+        '''signal handler for SIGCHLD'''
+        while True:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+            except OSError:
+                break
+            if not pid:
+                break
+            info = self.pidinfo.pop(pid, None)
+            if info:
+                svc, cai = info
+                sys.stderr.write("%r %r %d %04x\n" % (svc.path, cai, pid, status))
+
+class Service(object):
+    '''service'''
+
+    def __init__(self, vmname, svcname, fspec, path):
+        '''init'''
+        self.vmname = vmname
+        self.svcname = svcname
+        self.path = path
+
+        owner = None
+        group = None
+        mode = None
+        if fspec and fspec != '-':
+            fst = fspec.split(':', 2)
+            mode = int(fst[0], 8)
+            if len(fst) > 2:
+                try:
+                    owner = int(fst[1], 10)
+                except ValueError:
+                    owner = pwd.getpwnam(fst[1])[2]
+            if len(fst) > 1:
+                try:
+                    group = int(fst[-1], 10)
+                except ValueError:
+                    group = grp.getgrnam(fst[1])[2]
+        self.owner = owner
+        self.group = group
+        self.mode = mode
+        self.socket = None
+
+    def open(self):
+        '''open'''
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+        path, owner, group, mode = self.path, self.owner, self.group, self.mode
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.socket.setblocking(False)
+            try:
+                os.makedirs(os.path.dirname(path), 0o755)
+            except OSError:
+                if get_errno() != errno.EEXIST:
+                    raise
+            self.socket.bind(path)
+            if owner is not None or group is not None:
+                os.chown(path,
+                         -1 if owner is None else owner,
+                         -1 if group is None else group)
+            if mode is not None:
+                os.chmod(path, mode)
+            self.socket.listen(127)
+            return self.socket.fileno()
+        except:
+            self.socket.close()
+            raise
+
+    def serve_once(self, reaper, stderr=None):
+        '''serve'''
+        try:
+            csk, cai = self.socket.accept()
+        except SocketError:
+            err = get_errno()
+            if err == errno.ENOMEM:
+                time.sleep(1)
+            elif err not in ACCEPT_IGNORE_ERRNOS:
+                raise
+            traceback.print_exc()
+            return False
+        try:
+            pid = subprocess.Popen(
+                ["qrexec-client-vm", self.vmname, self.svcname],
+                executable="/usr/bin/qrexec-client-vm",
+                stdin=csk, stdout=csk, stderr=stderr,
+                shell=False, cwd='/').pid
+        except OSError:
+            sys.stderr.write("%r %r FAIL:\n" % (self.path, cai))
+            traceback.print_exc()
+            sys.stderr.flush()
+            return False
+        else:
+            reaper.pidinfo[pid] = (self, cai)
+            sys.stderr.write("%r %r %d\n" % (self.path, cai, pid))
+            sys.stderr.flush()
+            return True
+        finally:
+            csk.close()
+
+    def close(self):
+        '''close'''
+        skt = self.socket
+        if skt is not None:
+            skt.close()
+
+if sys.version_info >= (3, 3):
+    def get_errno():
+        '''hi'''
+        return sys.exc_info()[1].errno
+else:
+    def get_errno():
+        '''hi'''
+        return sys.exc_info()[1][0]
+
+def sd_notify(unset_environment, state):
+    '''See systemd sd_notify(3).'''
+    addr = (os.environ.pop if unset_environment else os.environ.get)(
+        'NOTIFY_SOCKET', None)
+    if addr is None:
+        return False
+    if addr[0] == '@':
+        addr = '\0' + addr[1:]
+    state = str_to_bytes(state)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        sock.connect(addr)
+        sock.sendall(state)
+    finally:
+        sock.close()
+    return True
+
+def drop_privileges():
+    '''hi'''
+    if os.getuid() == 0 or os.geteuid() == 0:
+        uid = pwd.getpwnam('user')[2]
+        gid = grp.getgrnam('qubes')[2]
+
+        os.setgroups([])
+        os.setresgid(gid, gid, gid)
+        os.setresuid(uid, uid, uid)
+
+def parse_config(config_file):
+    '''hi'''
+    els = []
+    opts = {}
+    if sys.version_info[0] >= 3:
+        opts['errors'] = 'surrogateescape'
+    with open(config_file, 'r', **opts) as cfile:
+        while True:
+            line = cfile.readline()
+            if not line:
+                break
+            line = line[:-1].lstrip().replace('\0', '\n')
+            if line and not line.startswith('#'):
+                els.append(Service(*line.split('\t', 3)))
+    return els
+
+def wrapped_poll(poll, timeout=None):
+    '''hi'''
+    try:
+        return poll.poll(timeout)
+    except SelectError:
+        if get_errno() != errno.EINTR:
+            raise
+    return []
+
+def main(config_file):
+    '''hi'''
+    els = parse_config(config_file)
+    if not els:
+        sd_notify(True, 'READY=1\nSTATUS=Exiting because no sockets are specified')
+        return
+
+    reaper = ChildrenReaper()
+    signal.signal(signal.SIGCHLD, reaper)
+
+    poll = select.poll()
+    skfds = {}
+    nfd = None
+    try:
+        for svc in els:
+            sfd = svc.open()
+            skfds[sfd] = svc
+            poll.register(sfd, select.POLLIN | select.POLLPRI
+                          | select.POLLERR | select.POLLHUP)
+
+        #nfd = os.open(os.devnull, os.O_WRONLY | os.O_NOCTTY)
+
+        sd_notify(True,
+                  'READY=1\nMAINPID=%d\nSTATUS=Listening on %d socket(s)'
+                  % (os.getpid(), len(els)))
+
+        drop_privileges()
+
+        while True:
+            prs = wrapped_poll(poll)
+            reaper()
+            for rfd, _ in prs:
+                svc = skfds.get(rfd)
+                if svc:
+                    svc.serve_once(reaper, nfd)
+    finally:
+        if nfd is not None and nfd >= 0:
+            os.close(nfd)
+        for svc in reversed(els):
+            svc.close()
+
+if __name__ == '__main__':
+    main(sys.argv[1])

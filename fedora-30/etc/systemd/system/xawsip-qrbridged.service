@@ -1,0 +1,11 @@
+[Unit]
+Description=xawsip qrexec bridge socket daemon
+ConditionPathExists=/rw/config/xawsip-qrbridged
+Requires=rw.mount
+
+[Service]
+Type=notify
+ExecStart=/opt/xawsip-qrbridged /rw/config/xawsip-qrbridged
+
+[Install]
+WantedBy=multi-user.target

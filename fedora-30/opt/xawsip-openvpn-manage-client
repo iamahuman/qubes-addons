@@ -1,0 +1,314 @@
+#!/usr/bin/python
+# Copyright (c) 2019 Jinoh Kang
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+# pylint: disable=missing-docstring, invalid-name, useless-object-inheritance, too-few-public-methods
+import sys
+import re
+import socket
+import errno
+import logging
+import select
+import subprocess
+
+ERRNOS_BLOCKING = frozenset((errno.EAGAIN, errno.EWOULDBLOCK))
+
+try:
+    SelectError = select.error
+    def get_select_errno():
+        return sys.exc_info()[1][0]
+except AttributeError:
+    SelectError = OSError
+    def get_select_errno():
+        return sys.exc_info()[1].errno
+
+try:
+    SocketError = socket.error
+    def get_socket_errno():
+        return sys.exc_info()[1][0]
+except AttributeError:
+    SocketError = OSError
+    def get_socket_errno():
+        return sys.exc_info()[1].errno
+
+logging.basicConfig(level=logging.WARNING)
+
+log = logging.getLogger(__name__)
+
+# emulate isspace(3) behavior - enable LOCALE
+TOKEN_RE = re.compile(
+    br'(?P<u>(?:[^\s\0;#\\\'"]|\\[\s\0\\"])(?:[^\s\0\\]|\\[\s\0\\"])*)'
+    br'(?:(?P<A>\\[^\s\0\\"])|(?P<B>\\$))?|'
+    br'"(?P<q>(?:[^\\"]|\\[\s\0\\"])*)'
+    br'(?:"|(?P<C>\\?$)|(?P<D>\\[^\s\0\\"])?)|'
+    br"'(?P<s>[^']*)(?:'|(?P<E>$))|"
+    br'(?:\\?[\s\0])*(?:\\$|\\?(?:[\s\0]|(?P<c>[;#])))|'
+    br'(?P<F>\\[^\s\0\\"])|(?P<G>.)',
+    re.DOTALL | re.LOCALE
+)
+UNESC_RE = re.compile(br'\\(.)')
+DQUOTE_BACKSLASH_RE = re.compile(br'[\\"]')
+SPACE_METACHR_RE = re.compile(br"[\s\0;#']", re.LOCALE)
+OPENVPN_STATUS_RE = re.compile(br'(SUCCESS|ERROR): (.*)', re.DOTALL)
+OPENVPN_NOTIFY_RE = re.compile(br'>([^:]*):(.*)', re.DOTALL)
+OPENVPN_NEED_RE = re.compile(br"Need '(.*)' ([^' ]*)(?: (?:MSG:|SC:(-?\d+),)(.*))?", re.DOTALL)
+
+class LexError(Exception):
+    pass
+
+def lex(cmdline):
+    args = []
+    errors = (
+        "warning: Bad backslash ('\\') usage",
+        "error: Residual parse state (2)",
+        'error: No closing quotation (")',
+        "warning: Bad backslash ('\\') usage",
+        "error: No closing single quotation (')",
+        "warning: Bad backslash ('\\') usage",
+        "error: Residual parse state (3)",
+    )
+    for match in re.finditer(TOKEN_RE, cmdline):
+        lsg = match.lastgroup
+        if lsg is not None:
+            if lsg == 'c':
+                break
+            lix = ord(lsg)
+            if lix <= 0x5a:
+                raise LexError(errors[lix - 0x41], match.start(lsg))
+            rsb = match.group(lsg)
+            args.append(rsb if lsg == 's' else UNESC_RE.sub(b'\\1', rsb))
+    return args
+
+def unlex_single(arg):
+    argk = DQUOTE_BACKSLASH_RE.sub(r'\\\g<0>', arg)
+    if len(argk) != len(arg) or SPACE_METACHR_RE.search(arg):
+        return argk.join((b'"', b'"'))
+    return arg
+
+def unlex(args):
+    return b' '.join(map(unlex_single, args))
+
+class ConfigError(Exception):
+    pass
+
+class Config(object):
+
+    def __init__(self):
+        self.cmds = []
+        self.resps = {
+            b'username': {},
+            b'password': {},
+            b'needok': {},
+            b'needstr': {},
+            b'client-auth': {},
+            b'client-auth-nt': {},
+            b'client-deny': {},
+        }
+
+    def add_line(self, ln):
+        args = lex(ln)
+        if not args:
+            return
+        rgs = None if len(args) < 3 else self.resps.get(args[0])
+        if rgs is not None:
+            key = args[1]
+            if key in rgs:
+                raise ConfigError('duplicate entry')
+            rgs[key] = (args[2:] if args[2].startswith(b'!')
+                        and len(args) > 3 else args[2])
+            return
+        self.cmds.append(args)
+
+
+class Client(object):
+
+    CHALL_KINDS = {
+        b'PASSWORD': b'password',
+        b'NEED-OK': b'needok',
+        b'NEED-STR': b'needstr'
+    }
+
+    def __init__(self, config):
+        self.config = config
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
+        self.state = None
+        self.read_buffer = None
+        self.write_buffer = None
+
+    def init(self, socket_path):
+        self.sock.connect(socket_path)
+        self.sock.setblocking(False)
+        self.state = 0
+        self.read_buffer = bytearray()
+        self.write_buffer = bytearray()
+        for cmd in self.config.cmds:
+            self.queue_cmd(cmd)
+        return self.sock.fileno()
+
+    def on_readable(self):
+        rb = self.read_buffer
+        try:
+            rb.extend(self.sock.recv(4096))
+        except SocketError:
+            if get_socket_errno() in ERRNOS_BLOCKING:
+                return False
+            raise
+        while True:
+            i = rb.find(b'\n')
+            if i < 0:
+                break
+            n = i - (i >= 1 and rb[i-1:i] == b'\r')
+            cmd = bytes(rb[:n])
+            del rb[:i+1]
+            self.process_cmd(cmd)
+        return True
+
+    def on_writable(self):
+        try:
+            n = self.sock.send(self.write_buffer)
+        except SocketError:
+            if get_socket_errno() in ERRNOS_BLOCKING:
+                return False
+            raise
+        else:
+            del self.write_buffer[:n]
+            return len(self.write_buffer) > 0
+
+    def get_poll_mask(self):
+        vf = select.POLLIN | select.POLLERR | select.POLLHUP
+        if self.write_buffer:
+            vf |= select.POLLOUT
+        return vf
+
+    def on_poll(self, revents):
+        if revents & (select.POLLIN | select.POLLERR | select.POLLHUP):
+            self.on_readable()
+        if revents & (select.POLLOUT | select.POLLERR):
+            self.on_writable()
+        return self.get_poll_mask()
+
+    def process_cmd(self, cmd):
+        m = OPENVPN_STATUS_RE.match(cmd)
+        if m:
+            s, t = m.groups()
+            if s == b'SUCCESS':
+                return self.on_success(t)
+            return self.on_failure(t)
+        m = OPENVPN_NOTIFY_RE.match(cmd)
+        if m:
+            s, t = m.groups()
+            self.on_notify(s, t)
+        return None
+
+    def on_success(self, t):
+        pass
+
+    def on_failure(self, t):
+        pass
+
+    def on_notify(self, s, t):
+        kind = self.CHALL_KINDS.get(s)
+        if kind is not None:
+            m = OPENVPN_NEED_RE.match(t)
+            if not m:
+                log.error("Unknown %r notify: %r", kind, t)
+                return
+            typ, alert_type, _, text = m.groups()
+            if kind == b'password' and alert_type == b'username/password':
+                if self.respond_chall((b'username', b'password'), typ, text) < 2:
+                    self.respond_chall(b'password', typ, text)
+            else:
+                self.respond_chall(kind, typ, text)
+
+    def respond_chall(self, kind, typ, extra):
+        next_kind = None
+        if isinstance(kind, tuple):
+            kind, next_kind = kind
+        val = self.config.resps[kind].get(typ)
+        sep = None
+        if isinstance(val, (tuple, list)):
+            sep = val[0][1:]
+            args = val[1:]
+            if extra is not None:
+                args = [x.replace(b'{{text}}', extra) for x in args]
+            try:
+                val = subprocess.check_output(args)
+            except (OSError, subprocess.CalledProcessError):
+                val = None
+            else:
+                if val.endswith(b'\n'):
+                    val = val[:-1]
+        if val is not None:
+            vak = None
+            if sep:
+                spr = val.split(sep, 1)
+                if len(spr) > 1:
+                    val, vak = spr
+            self.queue_cmd((kind, typ, val))
+            if next_kind is not None and vak is not None:
+                self.queue_cmd((next_kind, typ, vak))
+                return 2
+            return 1
+        return 0
+
+    def queue_cmd(self, args):
+        self.write_buffer.extend(unlex(args))
+        self.write_buffer.append(b'\n')
+
+    def close(self):
+        self.sock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, typ, val, tb):
+        self.close()
+
+
+def main(socket_path, config_file):
+    config = Config()
+    with open(config_file, 'rb') as cnf:
+        while True:
+            ln = cnf.readline()
+            if not ln:
+                break
+            config.add_line(ln[:-1])
+    with Client(config) as client:
+        cli_fd = client.init(socket_path)
+
+        poll = select.poll()
+        poll.register(cli_fd, client.get_poll_mask())
+
+        while poll is not None:
+            try:
+                res = poll.poll()
+            except SelectError:
+                if get_select_errno() != errno.EINTR:
+                    raise
+                res = ()
+            for rfd, revents in res:
+                if rfd == cli_fd:
+                    if revents & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                        poll = None
+                        break
+                    poll.modify(rfd, client.on_poll(revents))
+
+if __name__ == '__main__':
+    main(*sys.argv[1:])

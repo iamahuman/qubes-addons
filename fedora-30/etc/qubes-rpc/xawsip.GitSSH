@@ -1,0 +1,20 @@
+#!/bin/bash
+set -e
+
+unset _cmd _port _host
+cd /
+
+case "$QREXEC_SERVICE_ARGUMENT" in
+	r+*) _cmd=git-receive-pack ;;
+	u+*) _cmd=git-upload-pack ;;
+	a+*) _cmd=git-upload-archive ;;
+	*) exit 1 ;;
+esac
+_host="${QREXEC_SERVICE_ARGUMENT#*+}"
+_path="${_host#*+}"
+_host="${_host%%+*}"
+case "$_host" in
+	-*|*@*@*) exit 1 ;;
+esac
+_path="${_path//+/\/}"
+exec /usr/bin/ssh -F /rw/xawsip-ssh/xawsip-ssh-config -CTakxenone "$_host" "$_cmd" "$_path"

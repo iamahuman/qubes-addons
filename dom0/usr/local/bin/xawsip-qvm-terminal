@@ -1,0 +1,103 @@
+#!/usr/bin/python3
+# Copyright (c) 2019 Jinoh Kang
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+import os
+import sys
+import struct
+import subprocess
+import qubesadmin
+import xcffib
+import xcffib.xproto
+from xcffib.xproto import Atom, BadWindow, BadValue
+
+DEFAULT_SERVICE = 'qubes.StartApp+qubes-run-terminal'
+TERMINAL_EMULATOR_CMDLINE = ('/usr/bin/xfce4-terminal',)
+
+def get_single_active_vm_name(conn, root, atom_active_window, atom_qubes_vmname):
+    xcb_errors = (BadWindow, BadValue)
+    try:
+        prop1 = conn.core.GetProperty(
+                False, root, atom_active_window,
+                Atom.WINDOW, 0, 1).reply().value
+    except xcb_errors:
+        return None
+    try:
+        act_winid, = struct.unpack('I', prop1.buf())
+    except struct.error:
+        return None
+    try:
+        prop2 = conn.core.GetProperty(
+                False, act_winid, atom_qubes_vmname,
+                Atom.STRING, 0, 32767).reply().value
+    except xcb_errors:
+        return None
+    try:
+        return prop2.to_string()
+    except UnicodeError:
+        return None
+
+def get_active_vm(app, conn):
+    fn = conn.core.InternAtom
+    cookies = [fn(True, len(n), n) for n in (
+        b'_NET_ACTIVE_WINDOW', b'_QUBES_VMNAME')]
+    atoms = [c.reply().atom for c in cookies]
+    del fn, cookies
+    if Atom._None in atoms:
+        return
+    atom_aw, atom_vk = atoms
+    for scr in conn.setup.roots:
+        name = get_single_active_vm_name(conn, scr.root, atom_aw, atom_vk)
+        if name:
+            doms = app.domains
+            try:
+                return doms[name]
+            except KeyError:
+                pass
+            del doms
+
+def main(service=None, user=None):
+    devnull = subprocess.DEVNULL
+
+    app = qubesadmin.Qubes()
+    is_local = isinstance(app, qubesadmin.app.QubesLocal)
+
+    conn = xcffib.Connection()
+    try:
+        vm = get_active_vm(app, conn)
+    finally:
+        conn.disconnect()
+
+    if vm is None:
+        #sys.stderr.write(sys.argv[0] + ": Cannot find an active domU window\n")
+        #sys.exit(2)
+        os.execv(TERMINAL_EMULATOR_CMDLINE[0], TERMINAL_EMULATOR_CMDLINE)
+    else:
+        if not service:
+            service = DEFAULT_SERVICE
+        if not user:
+            user = vm.default_user
+        proc = vm.run_service(
+                service, user=user, wait=not is_local,
+                stdout=devnull, stderr=devnull)
+        proc.stdin.close()
+
+if __name__ == '__main__':
+    main(*sys.argv[1:])

@@ -1,0 +1,2 @@
+#!/bin/sh
+SOFTHSM2_CONF=/etc/xawsip-softhsm2.conf exec /usr/bin/p11-kit remote /usr/lib64/pkcs11/libsofthsm2.so

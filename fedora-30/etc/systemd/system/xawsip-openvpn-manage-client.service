@@ -1,0 +1,6 @@
+[Unit]
+ConditionPathExists=/rw/config/xawsip-openvpn-manage.txt
+Requires=rw.mount
+
+[Service]
+ExecStart=/opt/xawsip-openvpn-manage-client /run/openvpn-client/management /rw/config/xawsip-openvpn-manage.txt

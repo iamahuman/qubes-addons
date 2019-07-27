@@ -1,0 +1,155 @@
+#!/bin/sh
+# Copyright (c) 2019 Jinoh Kang
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+set -e
+
+unset _destvm _ro _size _kname _exitcode _force _allocsize _oldsize _name _fstrim_verbose _fnam _hnam
+
+as_first() { _allocsize=$1; }
+usage() {
+	echo >&2 "Usage: $0 <destvm> [block..]"
+	exit 1
+}
+run_trim() {
+	IFS=' ' read -r _ro _size _kname || {
+		printf >&2 '%40s: failed to query info\n' "$_name"
+		return 1
+	}
+	trap '' PIPE
+	if read -r _reply
+	then	printf >&2 '%40s: newlines in kname\n' "$_name"
+		return 1
+	fi
+	exec <&7 7<&-
+	[ "$_size" -gt 0 ] || {
+		printf >&2 '%40s: no bytes in device\n' "$_name"
+		return 0
+	}
+	[ "$_ro" = "0" ] || {
+		printf >&2 '%40s: read-only device\n' "$_name"
+		return 1
+	}
+	[ -b /dev/"$_kname" ] || [ -b /dev/block/"$_kname" ] || {
+		printf >&2 '%40s: unrecognized kname\n' "$_name" 
+		return 1
+	}
+	qubesdb-write \
+		/qubes-block-devices/"$_kname"/desc "$_name" \
+		/qubes-block-devices/"$_kname"/size "$_size" \
+		/qubes-block-devices/"$_kname"/mode W \
+		/qubes-block-devices '' || {
+		printf >&2 '%40s: failed to register block device to QubesDB\n' "$_name"
+		return 1
+	}
+	qvm-block attach --option frontend-dev=xvdu "$_destvm" dom0:"$_kname" || {
+		printf >&2 '%40s: failed to attach block dev\n' "$_name"
+		return 1
+	}
+	exec 9<&- || :
+	_exitcode=0
+	trap 'qvm-block detach "$_destvm" dom0:"$_kname"||:;exit "$_exitcode"' INT TERM EXIT
+	qvm-run --user=root --no-autostart --pass-io --no-gui "$_destvm" \
+'rmdir_exit(){ rmdir "$_tmpdir";exit "$_exitcode";};'\
+'umount_exit(){ umount "$_tmpdir";rmdir "$_tmpdir";exit "$_exitcode";};'\
+'umask 0077 && '\
+'_exitcode=0 && '\
+'_rootdev=/dev/xvdu && '\
+'_tmpdir=`exec mktemp -d /mnt/xawsip-invm-freespace.XXXXXXXX` && '\
+'trap rmdir_exit INT TERM PIPE EXIT && '\
+'for _dev in "$_rootdev"p*; do [ "$_dev" = "${_rootdev}p*" ] && _dev=$_rootdev;'\
+'fsck -Tn "$_dev" && '\
+'mount --make-private -o rw,errors=remount-ro,noatime,nodiratime,nosuid,noexec,nodev,discard "$_dev" "$_tmpdir"'\
+' || { _exitcode=$?; continue; };'\
+'trap umount_exit INT TERM PIPE EXIT && '\
+'fstrim '"$_fstrim_verbose"' "$_tmpdir" || _exitcode=$?;'\
+'umount "$_tmpdir";'\
+'trap rmdir_exit INT TERM PIPE EXIT;'\
+'done' || { _exitcode=$?
+		printf >&2 '%40s: failed to free space\n' "$_name"
+	}
+	exit "$_exitcode"
+}
+
+_destvm="$1"
+shift || usage
+case "$_destvm" in ''|[-$@]*|*/*) usage ;; esac
+qvm-start --skip-if-running "$_destvm" || exit
+_exitcode=0
+_force=n
+
+for _hnam in /proc/self/fd /dev/fd
+do	if [ -d "$_hnam" ]
+	then	_fnam=$_hnam/8
+		_hnam=$_hnam/9
+		break
+	fi
+	_hnam=
+done
+[ -n "$_hnam" ] || exit
+
+for _name in "$@"
+do	if [ "$_name" = "-f" ]
+	then	_force=y
+		continue
+	fi
+	if [ "$_force" != "y" ] && losetup -j "$_name" | grep -q '^'
+	then	printf >&2 '%40s: under a loop\n' "$_name"
+		continue
+	fi
+	exec 9< "$_name"
+	_allocsize=
+	_lodev=
+	_fstrim_verbose=-v
+	[ -b "$_hnam" ] || {
+		as_first `POSIXLY_CORRECT=1 exec ls -1Hds "$_hnam"`
+		[ "$_allocsize" -gt 0 ] || {
+			exec 9<&- || true
+			printf >&2 '%40s: no bytes\n' "$_name"
+			continue
+		}
+		_lodev=`losetup --show -f -- "$_hnam"` && exec 8<&9 9< "$_lodev" || {
+			exec 8<&- 9<&- || true
+			printf >&2 '%40s: loop setup fail\n' "$_name"
+			continue
+		}
+		losetup -d "$_lodev" 8<&- 9<&- || {
+			exec 8<&- 9<&- || true
+			printf >&2 '%40s: set autoclear flag fail\n' "$_name"
+			continue
+		}
+		_fstrim_verbose=
+	}
+	exec 7<&0
+	lsblk --all --bytes --nodeps --noheadings --raw --output RO,SIZE,KNAME \
+		"$_hnam" 7<&- 8<&- | run_trim 8<&- || _exitcode=$?
+	exec 9<&-
+	if [ x"$_allocsize" = x"" ]
+	then printf '%40s\n' "$_name"
+	elif	_oldsize=$_allocsize
+		fallocate -d "$_fnam" || true
+		as_first `POSIXLY_CORRECT=1 exec ls -1Hds "$_fnam"`
+	then printf '%40s:%10d ->%10d (%+10d)\n' "$_name" "$_oldsize" \
+		"$_allocsize" "$((_allocsize - _oldsize))" >&2
+	else printf '%40s:%10d ->       ???\n' "$_name" "$_oldsize"
+	fi
+	exec 8<&-
+done
+exit "$_exitcode"

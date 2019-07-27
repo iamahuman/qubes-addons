@@ -1,0 +1,8 @@
+[Unit]
+After=qubes-mount-dirs.service
+
+[Path]
+PathExists=/run/openvpn-client/management
+
+[Install]
+WantedBy=paths.target

@@ -1,0 +1,2 @@
+#!/bin/sh
+exec timeout -k1 3 /bin/sh -c '/usr/bin/stdbuf -i0 -o0 /usr/bin/head -c 131072 | /usr/bin/ssh-agent /opt/xawsip-sshagentcmd' xawsip-ssh-agent-wrapper 2> /dev/null
