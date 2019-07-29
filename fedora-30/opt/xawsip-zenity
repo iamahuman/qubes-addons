@@ -1,10 +1,7 @@
 #!/usr/bin/bash
-
 _user=`exec /usr/bin/qubesdb-read /default-user` || _user=user
-_cmd='echo $$ >> /tmp/qubes-session-waiter && { [ -f /tmp/qubes-session-env ] || exec /usr/bin/sleep inf; }'
-_cmd='[ -f /tmp/qubes-session-env ] || /usr/bin/sh -c '"'$_cmd'"'; . /tmp/qubes-session-env'
-_cmd="$_cmd"'; exec /usr/bin/zenity "$@"'
+_cmd='[ -f /tmp/qubes-session-env ]||(echo>>/tmp/qubes-session-waiter $BASHPID&&{ [ -f /tmp/qubes-session-env ]||exec /usr/bin/sleep inf;});. /tmp/qubes-session-env;exec /usr/bin/zenity "$@"'
 if [ "`exec /usr/bin/id -un`" = "$_user" ]
 then eval "$_cmd"
-else exec /usr/sbin/runuser -ls "$SHELL" -c "$_cmd" -- "$_user" "$0" "$@"
+else exec /usr/sbin/runuser -ls/usr/bin/bash -c "$_cmd" -- "$_user" "$0" "$@"
 fi
