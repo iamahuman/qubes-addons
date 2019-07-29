@@ -106,7 +106,7 @@ class Service(object):
                 try:
                     group = int(fst[-1], 10)
                 except ValueError:
-                    group = grp.getgrnam(fst[1])[2]
+                    group = grp.getgrnam(fst[-1])[2]
         self.owner = owner
         self.group = group
         self.mode = mode
@@ -154,10 +154,8 @@ class Service(object):
             return False
         try:
             pid = subprocess.Popen(
-                ["qrexec-client-vm", self.vmname, self.svcname],
-                executable="/usr/bin/qrexec-client-vm",
-                stdin=csk, stdout=csk, stderr=stderr,
-                shell=False, cwd='/').pid
+                ["/usr/bin/qrexec-client-vm", self.vmname, self.svcname],
+                stdin=csk, stdout=csk, stderr=stderr, cwd='/').pid
         except OSError:
             sys.stderr.write("%r %r FAIL:\n" % (self.path, cai))
             traceback.print_exc()
