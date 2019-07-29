@@ -21,11 +21,11 @@
 
 set -e
 
-unset _destvm _ro _size _kname _exitcode _force _allocsize _oldsize _name _fstrim_verbose _fnam _hnam
+unset _destvm _ro _size _kname _exitcode _force _allocsize _oldsize _name _fstrim_verbose _fnam _hnam _reply _watch_pid
 
-as_first() { _allocsize=$1; }
 usage() {
-	echo >&2 "Usage: $0 <destvm> [block..]"
+	exec >&2
+	echo "Usage: $0 <destvm> [block..]"
 	exit 1
 }
 run_trim() {
@@ -39,23 +39,28 @@ run_trim() {
 		return 1
 	fi
 	exec <&7 7<&-
-	[ "$_size" -gt 0 ] || {
-		printf >&2 '%40s: no bytes in device\n' "$_name"
-		return 0
+	[ "$_kname" != "" ] || {
+		printf >&2 '%40s: one or more missing fields from lsblk\n' "$_name"
+		return 1
 	}
 	[ "$_ro" = "0" ] || {
 		printf >&2 '%40s: read-only device\n' "$_name"
 		return 1
 	}
+	[ "$_size" -gt 0 ] || {
+		printf >&2 '%40s: no bytes in device\n' "$_name"
+		return 0
+	}
 	[ -b /dev/"$_kname" ] || [ -b /dev/block/"$_kname" ] || {
 		printf >&2 '%40s: unrecognized kname\n' "$_name" 
 		return 1
 	}
+	qubesdb-watch -n 1 /qubes-block-devices/"$_kname"/mode > /dev/null & _watch_pid=$!
 	qubesdb-write \
 		/qubes-block-devices/"$_kname"/desc "$_name" \
 		/qubes-block-devices/"$_kname"/size "$_size" \
 		/qubes-block-devices/"$_kname"/mode W \
-		/qubes-block-devices '' || {
+		/qubes-block-devices '' && wait "$_watch_pid" || {
 		printf >&2 '%40s: failed to register block device to QubesDB\n' "$_name"
 		return 1
 	}
@@ -63,7 +68,7 @@ run_trim() {
 		printf >&2 '%40s: failed to attach block dev\n' "$_name"
 		return 1
 	}
-	exec 9<&- || :
+	exec 9<&-
 	_exitcode=0
 	trap 'qvm-block detach "$_destvm" dom0:"$_kname"||:;exit "$_exitcode"' INT TERM EXIT
 	qvm-run --user=root --no-autostart --pass-io --no-gui "$_destvm" \
@@ -82,18 +87,24 @@ run_trim() {
 'fstrim '"$_fstrim_verbose"' "$_tmpdir" || _exitcode=$?;'\
 'umount "$_tmpdir";'\
 'trap rmdir_exit INT TERM PIPE EXIT;'\
-'done' || { _exitcode=$?
+'done' || {	_exitcode=$?
 		printf >&2 '%40s: failed to free space\n' "$_name"
 	}
-	exit "$_exitcode"
+	return "$_exitcode"
 }
 
-_destvm="$1"
-shift || usage
-case "$_destvm" in ''|[-$@]*|*/*) usage ;; esac
-qvm-start --skip-if-running "$_destvm" || exit
-_exitcode=0
 _force=n
+while _destvm="$1"
+do	shift || usage
+	if [ "$_destvm" = "-f" ]
+	then	_force=y
+	else	break
+	fi
+done
+case "$_destvm" in # (
+	''|[-$@]*|*/*) usage ;;
+esac
+qvm-start --skip-if-running "$_destvm" || exit
 
 for _hnam in /proc/self/fd /dev/fd
 do	if [ -d "$_hnam" ]
@@ -105,7 +116,8 @@ do	if [ -d "$_hnam" ]
 done
 [ -n "$_hnam" ] || exit
 
-for _name in "$@"
+_exitcode=0
+for _name
 do	if [ "$_name" = "-f" ]
 	then	_force=y
 		continue
@@ -119,7 +131,10 @@ do	if [ "$_name" = "-f" ]
 	_lodev=
 	_fstrim_verbose=-v
 	[ -b "$_hnam" ] || {
-		as_first `POSIXLY_CORRECT=1 exec ls -1Hds "$_hnam"`
+		_allocsize=`POSIXLY_CORRECT=1 exec ls -1Hds "$_hnam"`
+		for _allocsize in $_allocsize
+		do	break
+		done
 		[ "$_allocsize" -gt 0 ] || {
 			exec 9<&- || true
 			printf >&2 '%40s: no bytes\n' "$_name"
@@ -145,9 +160,12 @@ do	if [ "$_name" = "-f" ]
 	then printf '%40s\n' "$_name"
 	elif	_oldsize=$_allocsize
 		fallocate -d "$_fnam" || true
-		as_first `POSIXLY_CORRECT=1 exec ls -1Hds "$_fnam"`
+		_allocsize=`POSIXLY_CORRECT=1 exec ls -1Hds "$_fnam"` && \
+			for _allocsize in $_allocsize
+			do	break
+			done
 	then printf '%40s:%10d ->%10d (%+10d)\n' "$_name" "$_oldsize" \
-		"$_allocsize" "$((_allocsize - _oldsize))" >&2
+		"$_allocsize" "$((_allocsize - _oldsize))"
 	else printf '%40s:%10d ->       ???\n' "$_name" "$_oldsize"
 	fi
 	exec 8<&-
