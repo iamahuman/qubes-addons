@@ -42,14 +42,18 @@ try:
 except AttributeError:
     SocketError = OSError
 
-if not hasattr('', 'decode') and hasattr('', 'encode'):
-    def str_to_bytes(x):
-        if isinstance(x, str):
-            return x.encode(errors='surrogateescape')
-        return x
-else:
-    def str_to_bytes(x):
-        return x
+text_type = str
+try:
+    if str is bytes:
+        text_type = unicode
+except NameError:
+    pass
+
+try:
+    fsencode = os.fsencode
+except AttributeError:
+    def fsencode(x):
+        return x.encode(sys.getfilesystemencoding(), 'surrogateescape')
 
 ACCEPT_IGNORE_ERRNOS = (
     errno.EINTR,
@@ -64,6 +68,7 @@ ACCEPT_IGNORE_ERRNOS = (
 
 class ChildrenReaper(object):
     '''hi'''
+    __slots__ = ('pidinfo',)
 
     def __init__(self):
         self.pidinfo = {}
@@ -91,18 +96,16 @@ class Service(object):
         self.svcname = svcname
         self.path = path
 
-        owner = None
-        group = None
-        mode = None
+        owner = group = mode = None
         if fspec and fspec != '-':
             fst = fspec.split(':', 2)
             mode = int(fst[0], 8)
-            if len(fst) > 2:
+            if len(fst) > 2 and fst[1]:
                 try:
                     owner = int(fst[1], 10)
                 except ValueError:
                     owner = pwd.getpwnam(fst[1])[2]
-            if len(fst) > 1:
+            if len(fst) > 1 and fst[-1]:
                 try:
                     group = int(fst[-1], 10)
                 except ValueError:
@@ -114,31 +117,34 @@ class Service(object):
 
     def open(self):
         '''open'''
+        path = self.path
         try:
-            os.unlink(self.path)
+            os.unlink(path)
         except OSError:
             pass
-        path, owner, group, mode = self.path, self.owner, self.group, self.mode
-        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        owner, group, mode = self.owner, self.group, self.mode
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            self.socket.setblocking(False)
+            sock.setblocking(False)
             try:
                 os.makedirs(os.path.dirname(path), 0o755)
             except OSError:
                 if get_errno() != errno.EEXIST:
                     raise
-            self.socket.bind(path)
+            sock.bind(path)
             if owner is not None or group is not None:
                 os.chown(path,
                          -1 if owner is None else owner,
                          -1 if group is None else group)
             if mode is not None:
                 os.chmod(path, mode)
-            self.socket.listen(127)
-            return self.socket.fileno()
+            sock.listen(127)
+            fd = sock.fileno()
+            self.socket = sock
         except:
-            self.socket.close()
+            sock.close()
             raise
+        return fd
 
     def serve_once(self, reaper, stderr=None):
         '''serve'''
@@ -171,9 +177,9 @@ class Service(object):
 
     def close(self):
         '''close'''
-        skt = self.socket
-        if skt is not None:
-            skt.close()
+        sock = self.socket
+        if sock is not None:
+            sock.close()
 
 if sys.version_info >= (3, 3):
     def get_errno():
@@ -186,17 +192,28 @@ else:
 
 def sd_notify(unset_environment, state):
     '''See systemd sd_notify(3).'''
+    if isinstance(state, text_type):
+        state = fsencode(state)
+    if not state:
+        raise ValueError("state must not be empty")
     addr = (os.environ.pop if unset_environment else os.environ.get)(
         'NOTIFY_SOCKET', None)
-    if addr is None:
+    if not addr:
         return False
-    if addr[0] == '@':
+    if addr.startswith('@'):
         addr = '\0' + addr[1:]
-    state = str_to_bytes(state)
+    sndbuf_level, sndbuf_opt = socket.SOL_SOCKET, socket.SO_SNDBUF
+    try:
+        flags = socket.MSG_NOSIGNAL
+    except AttributeError:
+        flags = 0 # 16384
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
-        sock.connect(addr)
-        sock.sendall(state)
+        try:
+            sock.setsockopt(sndbuf_level, sndbuf_opt, 8*1024*1024)
+        except SocketError:
+            pass
+        sock.sendto(state, flags, addr)
     finally:
         sock.close()
     return True
@@ -222,7 +239,9 @@ def parse_config(config_file):
             line = cfile.readline()
             if not line:
                 break
-            line = line[:-1].lstrip().replace('\0', '\n')
+            if line.endswith('\n'):
+                line = line[:-1]
+            line = line.lstrip().replace('\0', '\n')
             if line and not line.startswith('#'):
                 els.append(Service(*line.split('\t', 3)))
     return els
